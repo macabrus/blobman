@@ -1,0 +1,20 @@
+[tool.poetry]
+name = "blobman"
+version = "0.1.0"
+description = ""
+authors = ["Bernard Crnković <bernard.crnkovic@icloud.com>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.11"
+invoke = "^2.2.0"
+click = "^8.1.7"
+cattrs = "^23.2.3"
+
+[tool.poetry.scripts]
+blob = 'blobman:cli'
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

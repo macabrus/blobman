@@ -1,0 +1,4 @@
+.blobman/password.txt
+dist/
+.blobman/
+__pycache__/
