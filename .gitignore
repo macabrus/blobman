@@ -1,2 +1,5 @@
 dist/
 __pycache__/
+.blobman/password.txt
+.blobman/worktree-lock.json
+.repo/

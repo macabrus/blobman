@@ -1,0 +1,7 @@
+{
+    "git_root": "/Users/bernard/projects/personal/blobman",
+    "repository_url": ".repo",
+    "include_patterns": {
+        "9c6e1e88": "dist"
+    }
+}

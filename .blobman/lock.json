@@ -1,0 +1,14 @@
+{
+    "snapshot_id": "041661da",
+    "tracked_files": [
+        {
+            "file": "dist/a.txt"
+        },
+        {
+            "file": "dist/blobman-0.1.0-py3-none-any.whl"
+        },
+        {
+            "file": "dist/blobman-0.1.0.tar.gz"
+        }
+    ]
+}

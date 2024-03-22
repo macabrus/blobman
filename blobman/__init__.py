@@ -57,47 +57,41 @@ def init():
     PASSWORD_PATH.touch(exist_ok=True)
 
     GITIGNORE_PATH.touch(exist_ok=True)
+
+    run('restic init', hide=True, env=_get_env(c))
+    run(f'git add {VCS_LOCK_PATH} {CONFIG_PATH}', hide=True)
+
     _ensure_line('.blobman/password.txt', GITIGNORE_PATH)
     _ensure_line('.blobman/worktree-lock.json', GITIGNORE_PATH)
     _store_config(c)
 
-    run('restic init', env=_get_env(c))
-    run(f'git add {WORKTREE_LOCK_PATH} {CONFIG_PATH}')
 
 
 @cli.command(help='take a snapshot of local blobs')
 @click.option('--dry', 'dry', is_flag=True, default=False, help='show what will be snapshoted')
 def snapshot(dry):
     c = _load_config()
-    env = _get_env(c)
-    files = list(_ls(c))
+    ensure_no_collisions(c)
     if dry:
-        old_locked_files = [p['file'] for p in c.lock.tracked_files]
-        print('\nTracked files:\n')
-        new_files = []
-        for f in files:
-            print(f)
-            if f not in old_locked_files:
-                new_files.append(f)
-        
-        print('\nNew files:\n')
-        for f in new_files:
-            print(f)
-
+        worktree = set(p['file'] for p in c.worktree_lock.tracked_files)
+        remote = set(p['file'] for p in c.vcs_lock.tracked_files)
+        common = worktree.intersection(remote)
+        print('\nCommon files:\n')
+        print('\n'.join(common))
+        print('\nAdded files:\n')
+        print('\n'.join(worktree - remote))
         print('\nRemoved files:\n')
-        for f in old_locked_files:
-            if f not in files:
-                print()
+        print('\n'.join(remote - worktree))
         return
-    c.lock = LockInfo(
+    files = list(_ls(c))
+    c.worktree_lock = c.vcs_lock = LockInfo(
         tracked_files=[{'file': f} for f in files]
     )
     LIST_PATH.write_text(os.linesep.join(files))
-    res = run(f'restic backup --files-from-verbatim {str(LIST_PATH)}', env=env)
+    res = run(f'restic backup --files-from-verbatim {str(LIST_PATH)}', env=_get_env(c))
     os.remove(LIST_PATH)
-    c.snapshot_id = res.stdout.split('\n')[-2].split(' ')[1]
+    c.vcs_lock.snapshot_id = res.stdout.split('\n')[-2].split(' ')[1]
     _store_config(c)
-    _store_lock(c)
 
 
 @cli.command(help='ensure latest blobs are present')
@@ -112,32 +106,38 @@ def checkout():
 def status(diff):
     c = _load_config()
 
-    print('Patterns:')
-    print()
+    print('Patterns:\n')
     for id, pat in c.include_patterns.items():
-        print(id, pat)
+        print(id, '-', pat)
 
-    print()
-    print('Tracked blobs:')
-    print()
+    print('\nTracked blobs:\n')
     for p in _ls(c, root_dir=_git_root()):
         print(p)
 
-    print()
-    print('Snapshots:')
-    run('restic snapshots', env=_get_env(c))
-    print()
+    print('\nSnapshots:\n')
+    snapshots = json.loads(run('restic snapshots --json', hide=True, env=_get_env(c)).stdout)
+    print('\n'.join(s['id'][:8] + ' - ' + s['time'] for s in snapshots))
 
 
 @cli.command(help='track glob pattern')
-@click.argument('pattern', required=False)
+@click.argument('pattern')
 def add(pattern):
     c = _load_config()
     if pattern in c.include_patterns.values():
         return
-    while (id := hex(random.getrandbits(28))[2:]) in c.include_patterns:
+    while (id := hex(random.getrandbits(32))[2:]) in c.include_patterns:
         pass
     c.include_patterns[id] = pattern
+    files = list(_ls(c))
+    c.worktree_lock = LockInfo(
+        tracked_files=[
+            {
+                'file': f,
+                'hash': run(f'shasum {f} | awk "{{ print $1 }}"', hide=True).stdout.strip()
+            }
+            for f in files
+        ]
+    )
     print(f'{id} - {pattern}')
     _store_config(c)
 
@@ -175,7 +175,7 @@ def _load_config() -> BlobmanConfig:
         json.loads(CONFIG_PATH.read_text()) | {
             'git_root': _git_root(),
             'repository_password': PASSWORD_PATH.read_text(),
-            'lock': json.loads(VCS_LOCK_PATH.read_text()),
+            'vcs_lock': json.loads(VCS_LOCK_PATH.read_text()),
             'worktree_lock': json.loads(WORKTREE_LOCK_PATH.read_text())
         },
         BlobmanConfig
@@ -184,7 +184,7 @@ def _load_config() -> BlobmanConfig:
 
 def _store_config(config: BlobmanConfig) -> None:
     o = cattrs.unstructure(config)
-    PASSWORD_PATH.write_text(json.dumps(o.pop('repository_password'), indent=4))
+    PASSWORD_PATH.write_text(o.pop('repository_password'))
     VCS_LOCK_PATH.write_text(json.dumps(o.pop('vcs_lock'), indent=4))
     WORKTREE_LOCK_PATH.write_text(json.dumps(o.pop('worktree_lock'), indent=4))
     CONFIG_PATH.write_text(json.dumps(o, indent=4))
@@ -194,7 +194,7 @@ def _get_env(c: BlobmanConfig):
     return {
         'PWD': _git_root(),
         'RESTIC_REPOSITORY': c.repository_url,
-        'RESTIC_PASSWORD': PASSWORD_PATH.read_text().strip(),
+        'RESTIC_PASSWORD': c.repository_password,
     }
 
 
@@ -205,11 +205,22 @@ def _ls(c: BlobmanConfig, root_dir=None):
         if Path(p).is_dir():
             paths |= set(glob.glob(str(Path(p) / '**'), recursive=True, include_hidden=False))
     for p in set(paths):
-        if Path(p).is_dir():
-            paths.discard(str(Path(p)))
-            paths.add(os.path.join(p, ""))  # ensure trailing slash on dirs
+        if not Path(p).is_file():
+            paths.discard(p)  # discard non-regular-files
     for p in sorted(paths):
         yield p
+
+
+# ensure no collisions between tracked files and git files
+def ensure_no_collisions(c: BlobmanConfig):
+    common = set(_ls(c)).intersection(set(_list_git_files()))
+    if common:
+        print('Error: collision between git tracked files and blobs\n')
+        print('\nFollowing files are tracked both by .git and blobman:\n')
+        print('\n'.join(common))
+        print('\nIn order to fix a problem, you must correct following patterns:\n')
+        print('... TODO')
+        exit(1)
 
 
 def _ensure_line(line, file):
@@ -219,11 +230,6 @@ def _ensure_line(line, file):
         f.write(str(line) + os.linesep)
 
 
-# get a list of filest currently managed by blobman
-def _list_blob_files():
-    ...
-
-
 # get a list of files tracked by git
 def _list_git_files():
-    return run('git ls-tree -r HEAD --name-only').stdout.split(os.linesep)
+    return run('git ls-tree -r HEAD --name-only', hide=True).stdout.split(os.linesep)
