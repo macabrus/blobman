@@ -95,15 +95,21 @@ def snapshot(dry):
 
 
 @cli.command(help='ensure latest blobs are present')
-def checkout():
+@click.option('--dry', 'dry', is_flag=True, default=False)
+@click.option('-d', '--delete', 'delete', is_flag=True, default=False,
+              help='remove files matching pattern not present in snapshot')
+@click.option('-o', '--overwrite', 'overwrite', is_flag=True, default=False,
+              help='overwrite local files which are present in snapshot')
+def checkout(dry, delete, overwrite):
+    # TODO
     c = _load_config()
     env = _get_env(c)
+    files = _ls(c)
     run(f'restic restore {c.snapshot_id} --target "{os.getcwd()}"', env=env)
 
 
 @cli.command(help='list exact files & snapshot history')
-@click.option('--diff', is_flag=True, default=False, help='show diff of local & remote blobs')
-def status(diff):
+def status():
     c = _load_config()
 
     print('Patterns:\n')
@@ -116,7 +122,14 @@ def status(diff):
 
     print('\nSnapshots:\n')
     snapshots = json.loads(run('restic snapshots --json', hide=True, env=_get_env(c)).stdout)
-    print('\n'.join(s['id'][:8] + ' - ' + s['time'] for s in snapshots))
+    for s in snapshots:
+        print(
+            '{} {} {}'.format(
+                s['id'][:8],
+                '*' if s['id'][:8] == c.worktree_lock.snapshot_id else ' ',
+                s['time'],
+            )
+        )
 
 
 @cli.command(help='track glob pattern')
