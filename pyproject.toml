@@ -15,7 +15,15 @@ pendulum = "^3.0.0"
 [tool.poetry.scripts]
 blobman = 'blobman:cli'
 
-
 [build-system]
 requires = ["poetry-core"]
 build-backend = "poetry.core.masonry.api"
+
+[[tool.poetry.source]]
+name = "gitea"
+url = "https://gitea.bernardcrnkovic.from.hr/api/packages/bernard/pypi"
+default = true
+
+[[tool.poetry.source]]
+name = "dev9"
+url = "https://dev9.eindigo.net/api/packages/bernard/pypi"
