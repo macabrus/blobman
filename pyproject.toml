@@ -10,9 +10,10 @@ python = "^3.11"
 invoke = "^2.2.0"
 click = "^8.1.7"
 cattrs = "^23.2.3"
+pendulum = "^3.0.0"
 
 [tool.poetry.scripts]
-blob = 'blobman:cli'
+blobman = 'blobman:cli'
 
 
 [build-system]

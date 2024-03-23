@@ -1,3 +1,4 @@
+import datetime
 from getpass import getpass
 import glob
 import itertools
@@ -10,6 +11,7 @@ import cattrs
 import click
 from invoke import run
 from attrs import define
+import pendulum
 
 
 def _git_root(start=os.getcwd()):
@@ -25,13 +27,12 @@ GIT_ROOT = Path(_git_root())
 GITIGNORE_PATH = GIT_ROOT / '.gitignore'
 BLOBMAN_PATH = GIT_ROOT / Path('.blobman/')
 CONFIG_PATH = BLOBMAN_PATH / 'config.json'
-VCS_LOCK_PATH = BLOBMAN_PATH / 'lock.json'
-WORKTREE_LOCK_PATH = BLOBMAN_PATH / 'worktree-lock.json'
+LOCK_PATH = BLOBMAN_PATH / 'lock.json'
 LIST_PATH = BLOBMAN_PATH / 'list.txt'
 PASSWORD_PATH = BLOBMAN_PATH / 'password.txt'
 
 
-@click.group
+@click.group(help='A simple large binary file manager alongside git, based on Restic backup tool.')
 def cli():
     ...
 
@@ -52,60 +53,68 @@ def init():
 
     BLOBMAN_PATH.mkdir(parents=True, exist_ok=True)
     CONFIG_PATH.touch(exist_ok=True)
-    WORKTREE_LOCK_PATH.touch(exist_ok=True)
-    VCS_LOCK_PATH.touch(exist_ok=True)
+    LOCK_PATH.touch(exist_ok=True)
     PASSWORD_PATH.touch(exist_ok=True)
 
     GITIGNORE_PATH.touch(exist_ok=True)
 
     run('restic init', hide=True, env=_get_env(c))
-    run(f'git add {VCS_LOCK_PATH} {CONFIG_PATH}', hide=True)
+    run(f'git add {LOCK_PATH} {CONFIG_PATH}', hide=True)
 
     _ensure_line('.blobman/password.txt', GITIGNORE_PATH)
-    _ensure_line('.blobman/worktree-lock.json', GITIGNORE_PATH)
     _store_config(c)
 
 
-
-@cli.command(help='take a snapshot of local blobs')
+@cli.command(help='snapshot local blob state remotely')
 @click.option('--dry', 'dry', is_flag=True, default=False, help='show what will be snapshoted')
 def snapshot(dry):
     c = _load_config()
-    ensure_no_collisions(c)
+    _ensure_no_collisions(c)
+    diff = _diff_locks(c.lock, c.worktree_lock)
     if dry:
-        worktree = set(p['file'] for p in c.worktree_lock.tracked_files)
-        remote = set(p['file'] for p in c.vcs_lock.tracked_files)
-        common = worktree.intersection(remote)
-        print('\nCommon files:\n')
-        print('\n'.join(common))
-        print('\nAdded files:\n')
-        print('\n'.join(worktree - remote))
-        print('\nRemoved files:\n')
-        print('\n'.join(remote - worktree))
+        _print_diff(diff)
         return
-    files = list(_ls(c))
-    c.worktree_lock = c.vcs_lock = LockInfo(
-        tracked_files=[{'file': f} for f in files]
-    )
-    LIST_PATH.write_text(os.linesep.join(files))
-    res = run(f'restic backup --files-from-verbatim {str(LIST_PATH)}', env=_get_env(c))
-    os.remove(LIST_PATH)
-    c.vcs_lock.snapshot_id = res.stdout.split('\n')[-2].split(' ')[1]
-    _store_config(c)
+    files = [f['file'] for f in c.worktree_lock.tracked_files]
 
-
-@cli.command(help='ensure latest blobs are present')
-@click.option('--dry', 'dry', is_flag=True, default=False)
-@click.option('-d', '--delete', 'delete', is_flag=True, default=False,
-              help='remove files matching pattern not present in snapshot')
-@click.option('-o', '--overwrite', 'overwrite', is_flag=True, default=False,
-              help='overwrite local files which are present in snapshot')
-def checkout(dry, delete, overwrite):
-    # TODO
-    c = _load_config()
+    # save worktree lock upfront
     env = _get_env(c)
-    files = _ls(c)
-    run(f'restic restore {c.snapshot_id} --target "{os.getcwd()}"', env=env)
+    snaps = json.loads(run('restic snapshots --json', hide=True, env=env).stdout)
+    tags = set(t for s in snaps for t in s.get('tags', ()) if t.startswith('blobmanid:'))
+    while ('blobmanid:' + (id := hex(random.getrandbits(32))[2:])) in tags:
+        pass
+    c.lock = c.worktree_lock  # (same object now)
+    c.lock.snapshot_tag = id
+    _store_config(c)  # TODO: not assume it won't break... store and later do atomic move...
+
+    LIST_PATH.write_text('\n'.join(files + ['.blobman/lock.json']))
+    run(f'restic backup --tag blobmanid:{id} --files-from-verbatim {str(LIST_PATH)}', env=env)
+    os.remove(LIST_PATH)
+
+
+@cli.command(help='sync local state with expected state in lockfile')
+@click.argument('target', required=False)
+@click.option('--dry', 'dry', is_flag=True, default=False)
+def checkout(target, dry):
+    c = _load_config()
+    if not target:
+        target = c.lock.snapshot_tag
+
+    env = _get_env(c)
+    snaps = json.loads(run('restic snapshots --json', env=env, hide=True).stdout)
+    snapshot_id = next(s['short_id'] for s in snaps if f'blobmanid:{target}' in s['tags'])
+
+    target_lock = None
+    if target == c.lock.snapshot_tag:
+        target_lock = c.lock
+    else:
+        res = run(f'restic dump {snapshot_id} .blobman/lock.json', env=env, hide=True)
+        target_lock = cattrs.structure(json.loads(res.stdout), LockInfo)
+
+    diff = _diff_locks(c.worktree_lock, target_lock)
+    if dry:
+        _print_diff(diff)
+        return
+    run(f'restic restore {snapshot_id} --target "{c.git_root}"', env=env, hide=True)
 
 
 @cli.command(help='list exact files & snapshot history')
@@ -117,17 +126,21 @@ def status():
         print(id, '-', pat)
 
     print('\nTracked blobs:\n')
-    for p in _ls(c, root_dir=_git_root()):
+    for p in _ls(c.include_patterns, root_dir=_git_root()):
         print(p)
 
     print('\nSnapshots:\n')
     snapshots = json.loads(run('restic snapshots --json', hide=True, env=_get_env(c)).stdout)
-    for s in snapshots:
+    by_date = lambda s: datetime.datetime.fromisoformat(s['time'])
+    for s in sorted(snapshots, reverse=True, key=by_date):
+        id = next(s.removeprefix('blobmanid:') for s in s['tags'] if s.startswith('blobmanid:'))
+        now, then = pendulum.now(), pendulum.parse(s['time'])
         print(
-            '{} {} {}'.format(
-                s['id'][:8],
-                '*' if s['id'][:8] == c.worktree_lock.snapshot_id else ' ',
-                s['time'],
+            "{} {} | {} ({})".format(
+                id,
+                "*" if id == c.worktree_lock.snapshot_tag else " ",
+                (now - then).in_words() + ' ago',
+                then.to_day_datetime_string(),
             )
         )
 
@@ -141,16 +154,7 @@ def add(pattern):
     while (id := hex(random.getrandbits(32))[2:]) in c.include_patterns:
         pass
     c.include_patterns[id] = pattern
-    files = list(_ls(c))
-    c.worktree_lock = LockInfo(
-        tracked_files=[
-            {
-                'file': f,
-                'hash': run(f'shasum {f} | awk "{{ print $1 }}"', hide=True).stdout.strip()
-            }
-            for f in files
-        ]
-    )
+    _ensure_no_collisions(c)
     print(f'{id} - {pattern}')
     _store_config(c)
 
@@ -165,7 +169,7 @@ def remove(pattern_id: str):
 
 @define(kw_only=True)
 class LockInfo:
-    snapshot_id: str | None = None
+    snapshot_tag: str | None = None
     tracked_files: list[dict[str, str]] = field(factory=list)
 
 
@@ -175,21 +179,45 @@ class BlobmanConfig:
     repository_url: str
     repository_password: str
     include_patterns: dict[str, str] = field(factory=dict)
-    vcs_lock: LockInfo = field(factory=LockInfo)
+    lock: LockInfo = field(factory=LockInfo)
     worktree_lock: LockInfo = field(factory=LockInfo)
 
 
+@define(kw_only=True)
+class LockDiff:
+    added_files: list[dict[str, str]] = field(factory=list)
+    removed_files: list[dict[str, str]] = field(factory=list)
+    modified_files: list[dict[str, str]] = field(factory=list)
+    unchanged_files: list[dict[str, str]] = field(factory=list)
+
+
 def _load_config() -> BlobmanConfig:
-    for p in (CONFIG_PATH, VCS_LOCK_PATH, WORKTREE_LOCK_PATH):
+    for p in (CONFIG_PATH, LOCK_PATH,):
         if not p.exists():
             print(f'Error: file not found {p}')
             exit(1)
+    config_json = json.loads(CONFIG_PATH.read_text())
+    lock = json.loads(LOCK_PATH.read_text())
+    worktree_lock = {
+        'tracked_files': [
+            {
+                'file': f,
+                'hash': run(f'shasum {f} | awk "{{ print $1 }}"', hide=True).stdout.strip()
+            } for f in _ls(config_json['include_patterns'])
+        ]
+    }
+    lock_map = {f['file']: f['hash'] for f in lock['tracked_files']}
+    worktree_map = {f['file']: f['hash'] for f in worktree_lock['tracked_files']}
+    if lock_map == worktree_map:
+        worktree_lock['snapshot_tag'] = lock['snapshot_tag']
+    else:
+        worktree_lock['snapshot_tag'] = None
     return cattrs.structure(
-        json.loads(CONFIG_PATH.read_text()) | {
+        config_json | {
             'git_root': _git_root(),
             'repository_password': PASSWORD_PATH.read_text(),
-            'vcs_lock': json.loads(VCS_LOCK_PATH.read_text()),
-            'worktree_lock': json.loads(WORKTREE_LOCK_PATH.read_text())
+            'lock': lock,
+            'worktree_lock': worktree_lock,
         },
         BlobmanConfig
     )
@@ -197,9 +225,10 @@ def _load_config() -> BlobmanConfig:
 
 def _store_config(config: BlobmanConfig) -> None:
     o = cattrs.unstructure(config)
+    o.pop('git_root')
     PASSWORD_PATH.write_text(o.pop('repository_password'))
-    VCS_LOCK_PATH.write_text(json.dumps(o.pop('vcs_lock'), indent=4))
-    WORKTREE_LOCK_PATH.write_text(json.dumps(o.pop('worktree_lock'), indent=4))
+    LOCK_PATH.write_text(json.dumps(o.pop('lock'), indent=4))
+    o.pop('worktree_lock')
     CONFIG_PATH.write_text(json.dumps(o, indent=4))
 
 
@@ -211,9 +240,9 @@ def _get_env(c: BlobmanConfig):
     }
 
 
-def _ls(c: BlobmanConfig, root_dir=None):
+def _ls(patterns: dict[str, str], root_dir=None):
     fn = lambda p: glob.glob(p, recursive=True, include_hidden=False)
-    paths = set(itertools.chain(*map(fn, c.include_patterns.values())))
+    paths = set(itertools.chain(*map(fn, patterns.values())))
     for p in set(paths):
         if Path(p).is_dir():
             paths |= set(glob.glob(str(Path(p) / '**'), recursive=True, include_hidden=False))
@@ -225,8 +254,11 @@ def _ls(c: BlobmanConfig, root_dir=None):
 
 
 # ensure no collisions between tracked files and git files
-def ensure_no_collisions(c: BlobmanConfig):
-    common = set(_ls(c)).intersection(set(_list_git_files()))
+def _ensure_no_collisions(c: BlobmanConfig):
+    blob_matching = set(_ls(c.include_patterns))
+    git_staged = set(run("git diff --name-only --cached", hide=True).stdout.split('\n'))
+    git_tracked = set(run('git ls-tree -r HEAD --name-only', hide=True).stdout.split('\n'))
+    common = blob_matching.intersection(git_staged) | blob_matching.intersection(git_tracked)
     if common:
         print('Error: collision between git tracked files and blobs\n')
         print('\nFollowing files are tracked both by .git and blobman:\n')
@@ -237,12 +269,37 @@ def ensure_no_collisions(c: BlobmanConfig):
 
 
 def _ensure_line(line, file):
-    if line in map(str.strip, Path(file).read_text().split(os.linesep)):
+    if line in map(str.strip, Path(file).read_text().split('\n')):
         return
     with Path(file).open('a') as f:
-        f.write(str(line) + os.linesep)
+        f.write(str(line) + '\n')
 
 
-# get a list of files tracked by git
-def _list_git_files():
-    return run('git ls-tree -r HEAD --name-only', hide=True).stdout.split(os.linesep)
+def _diff_locks(src: LockInfo, dst: LockInfo) -> LockDiff:
+    if src.snapshot_tag == dst.snapshot_tag and None not in (src.snapshot_tag, dst.snapshot_tag):
+        return LockDiff(
+            unchanged_files=set(p['file'] for p in src.tracked_files)
+        )
+    src_files = set(p['file'] for p in src.tracked_files)
+    dst_files = set(p['file'] for p in dst.tracked_files)
+    common_files = src_files.intersection(dst_files)
+    src_map = {f['file']: f['hash'] for f in src.tracked_files}
+    dst_map = {f['file']: f['hash'] for f in dst.tracked_files}
+    changed_files = set(p for p in common_files if src_map[p] != dst_map[p])
+    return LockDiff(
+        added_files=dst_files - src_files,
+        removed_files=src_files - dst_files,
+        modified_files=changed_files,
+        unchanged_files=common_files - changed_files,
+    )
+
+
+def _print_diff(diff: LockDiff) -> None:
+    print('\nUnchanged files:\n')
+    print('\n'.join(diff.unchanged_files))
+    print('\nModified files:\n')
+    print('\n'.join(diff.modified_files))
+    print('\nAdded files:\n')
+    print('\n'.join(diff.added_files))
+    print('\nRemoved files:\n')
+    print('\n'.join(diff.removed_files))
